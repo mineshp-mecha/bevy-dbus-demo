@@ -3081,6 +3081,7 @@ dependencies = [
 [[package]]
 name = "mechanix_debus_client"
 version = "0.1.0"
+source = "git+https://github.com/mineshp-mecha/bevy-dbus-demo.git#aa630a4d4d5121335ce9a255b906e602d6a889d5"
 dependencies = [
  "anyhow",
  "futures",

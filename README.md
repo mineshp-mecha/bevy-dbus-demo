@@ -13,6 +13,10 @@ It shows how to connect a real-time Bevy application with system-level or sessio
 ✅ Demo interaction: trigger events in the Bevy scene via D-Bus or send messages from Bevy to system services
 
 ---
+## How to run
+```
+cargo run --example counter
+```
 
 ## 📦 Project Structure
 
