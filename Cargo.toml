@@ -1,0 +1,16 @@
+[package]
+name = "counter_bevy"
+version = "0.1.0"
+edition = "2024"
+default-run = "counter_bevy"
+
+[dependencies]
+fastrand = "2.3.0"
+tokio = { version = "1.27.0", features = ["full"] }
+zmq = "0.10.0"
+regex = "1.11.1"
+dbus = "0.9.7"
+zbus = { version = "4.1.2" }
+async-std = "1.13.1"
+bevy = "0.16.0"
+mechanix_debus_client = { path = "/Users/mineshpurohit/projects/mecha/exploration/mechanix-services/client/dbus"}
