@@ -13,4 +13,4 @@ dbus = "0.9.7"
 zbus = { version = "4.1.2" }
 async-std = "1.13.1"
 bevy = "0.16.0"
-mechanix_debus_client = { git = "https://github.com/mineshp-mecha/bevy-dbus-demo.git"}
+freedesktop-network-manager-client = { path = "crate_path"}
