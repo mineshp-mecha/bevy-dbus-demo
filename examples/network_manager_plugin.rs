@@ -1,9 +1,10 @@
-use bevy::tasks::IoTaskPool;
+use crate::ErrorType::ToggleWifiError;
+use bevy::tasks::{AsyncComputeTaskPool, IoTaskPool};
 use bevy::{prelude::*, winit::WinitSettings};
 use freedesktop_network_manager_client::interfaces::wireless::WifiState;
 use freedesktop_network_manager_client::service::NetworkManagerService;
-use std::sync::mpsc::{channel, Receiver};
-use std::sync::{LazyLock, Mutex};
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::{LazyLock, Mutex, mpsc};
 
 fn main() {
     App::new()
@@ -19,12 +20,36 @@ fn main() {
 pub struct NetworkManagerServiceResource {
     pub service: Option<NetworkManagerService>,
 }
-
 #[derive(Resource)]
 pub struct WifiStateReceiver(pub Mutex<Receiver<WifiState>>);
 
 #[derive(Resource, Default)]
 struct WifiEventChannelInitialized(bool);
+
+#[derive(Resource, Clone)]
+pub struct WifiStatus {
+    pub connected: bool,
+    pub last_error: Option<String>,
+}
+#[derive(Resource)]
+pub struct WifiStatusReceiver {
+    receiver: Mutex<Receiver<WifiStatus>>,
+}
+#[derive(Debug, Clone)]
+pub enum NetworkAction {
+    ToggleWifi(bool), // true = enable, false = disable
+    SwitchNetwork(String), // network name or id
+                      // Add more actions as needed
+}
+#[derive(Event)]
+pub struct NetworkActionEvent(pub NetworkAction);
+#[derive(Debug, Clone)]
+pub enum ErrorType {
+    ToggleWifiError(String),
+}
+#[derive(Event)]
+pub struct WifiErrorEvent(pub ErrorType);
+
 pub struct NetworkManagerServicePlugin;
 
 impl Plugin for NetworkManagerServicePlugin {
@@ -32,15 +57,26 @@ impl Plugin for NetworkManagerServicePlugin {
         app.add_event::<WifiStateEvent>()
             .insert_resource(NetworkManagerServiceResource { service: None })
             .insert_resource(WifiEventChannelInitialized(false))
-            .insert_resource(WifiEventText("Connected".to_string()))
+            .insert_resource(WifiStatus {
+                connected: false,
+                last_error: None,
+            })
+            .add_event::<NetworkActionEvent>()
+            .add_event::<WifiErrorEvent>()
             .add_systems(Startup, init_network_manager_service) // Async task so temp move service result to static
             .add_systems(Update, poll_service_init) // Once a service is initialized, it will move service from static to resource
             .add_systems(Update, setup_wifi_event_channel_async) // Async task so temp move result to static
             .add_systems(
                 Update,
                 (
+                    handle_network_action_events,
+                    poll_wifi_error_events.after(handle_network_action_events),
+                ),
+            )
+            .add_systems(
+                Update,
+                (
                     poll_wifi_event_channel, // Once a channel is initialized, it will move a result from static to resource
-                    enable_wifi_system.run_if(service_ready),
                     wifi_event_bridge_system.after(poll_wifi_event_channel),
                 ),
             )
@@ -119,36 +155,6 @@ fn poll_service_init(mut resource: ResMut<NetworkManagerServiceResource>) {
         resource.service = Some(service);
     }
 }
-fn enable_wifi_system(
-    resource: Res<NetworkManagerServiceResource>,
-    mut queries: ParamSet<(
-        Query<
-            (
-                &Interaction,
-                Option<&ButtonAction>, // Added ButtonAction component
-            ),
-            (Changed<Interaction>, With<Button>),
-        >,
-        Query<&mut Text>,
-    )>,
-) {
-    if let Some(service) = &resource.service {
-        for (interaction, actions) in queries.p0().iter_mut() {
-            // println!("button text: {}", text.0);
-            match *interaction {
-                Interaction::Pressed => {
-                    let service = service.clone();
-                    IoTaskPool::get()
-                        .spawn(async move {
-                            let _ = service.set_wifi(true).await;
-                        })
-                        .detach();
-                }
-                _ => {}
-            }
-        }
-    }
-}
 
 fn wifi_event_bridge_system(
     wifi_rx: Option<Res<WifiStateReceiver>>,
@@ -174,12 +180,59 @@ fn handle_wifi_state_events(
         // Handle logic here
     }
 }
+fn handle_network_action_events(
+    mut events: EventReader<NetworkActionEvent>,
+    mut service: ResMut<NetworkManagerServiceResource>,
+    mut commands: Commands,
+) {
+    let (wifi_status_event_sender, wifi_status_event_receiver) = mpsc::channel();
+    let pool = AsyncComputeTaskPool::get();
+    for event in events.read() {
+        let NetworkActionEvent(action) = event;
+        match action {
+            NetworkAction::ToggleWifi(enable) => {
+                if let Some(service) = &mut service.service {
+                    let service = service.clone();
+                    let enable = *enable;
+                    let wifi_status_event_sender = wifi_status_event_sender.clone();
+                    pool.spawn(async move {
+                        if let Err(err) = service.toggle_wifi(enable).await {
+                            error!("failed to toggle wifi: {err}");
+                            let wifi_status = WifiStatus {
+                                connected: !enable,
+                                last_error: Some("Failed to toggle wifi".to_string()),
+                            };
+                            //Note: EventWriter is not thread safe, so use a std::mpsc
+                            let _ = wifi_status_event_sender.send(wifi_status);
+                        }
+                    })
+                    .detach();
+                }
+            }
+            NetworkAction::SwitchNetwork(network_id) => {
+                // handle switch network
+            } // Add more as needed
+        }
+    }
+    commands.insert_resource(WifiStatusReceiver {
+        receiver: Mutex::new(wifi_status_event_receiver),
+    });
+}
 
+// Polling system to insert write error into an event
+fn poll_wifi_error_events(
+    mut error_event_writer: EventWriter<WifiErrorEvent>,
+    event_receiver: ResMut<WifiStatusReceiver>,
+) {
+    let receiver = event_receiver.receiver.lock().unwrap();
+    while let Ok(state) = receiver.try_recv() {
+        if let Some(last_error) = state.last_error {
+            error_event_writer.write(WifiErrorEvent(ToggleWifiError(last_error)));
+        }
+    }
+}
 #[derive(Event, Debug, Clone)]
 pub struct WifiStateEvent(pub WifiState);
-
-#[derive(Resource, Component)]
-struct WifiEventText(String);
 
 #[derive(Clone, Copy, Component)]
 struct WifiStatusText;
@@ -190,12 +243,12 @@ enum ButtonAction {
 }
 
 const NORMAL_BUTTON: Color = Color::srgb(0.15, 0.15, 0.15);
-fn setup(mut commands: Commands, wifi_event_text: Res<WifiEventText>, assets: Res<AssetServer>) {
+fn setup(mut commands: Commands, assets: Res<AssetServer>) {
     // ui camera
     commands.spawn(Camera2d);
     // Text with one section
 
-    create_counter_text(&mut commands, &wifi_event_text, &assets);
+    create_counter_text(&mut commands, &assets);
 
     commands
         .spawn((
@@ -229,7 +282,7 @@ fn setup(mut commands: Commands, wifi_event_text: Res<WifiEventText>, assets: Re
         ));
 }
 
-fn create_counter_text(commands: &mut Commands, wifi_status: &WifiEventText, assets: &AssetServer) {
+fn create_counter_text(commands: &mut Commands, assets: &AssetServer) {
     commands
         .spawn((
             Button,
@@ -251,7 +304,7 @@ fn create_counter_text(commands: &mut Commands, wifi_status: &WifiEventText, ass
             BackgroundColor(NORMAL_BUTTON),
         ))
         .with_child((
-            Text::new(&wifi_status.0.to_string()),
+            Text::new("Connected"),
             TextFont {
                 font: assets.load("fonts/FiraSans-Bold.ttf"),
                 font_size: 33.0,
@@ -260,4 +313,21 @@ fn create_counter_text(commands: &mut Commands, wifi_status: &WifiEventText, ass
             TextColor(Color::srgb(0.9, 0.9, 0.9)),
             WifiStatusText, // Mark the text component
         ));
+}
+
+
+fn display_wifi_errors(mut events: EventReader<WifiErrorEvent> /* UI context */) {
+    for WifiErrorEvent(error) in events.read() {
+        match error {
+            ErrorType::ToggleWifiError(msg) => {
+                // Show the error message in your UI
+                println!("WiFi Toggle Error: {msg}");
+                // Or update a UI resource/component accordingly
+            } // Add more error variants as your enum grows
+        }
+    }
+}
+
+fn do_network_action(mut event_writer: EventWriter<NetworkActionEvent>) {
+    event_writer.write(NetworkActionEvent(NetworkAction::ToggleWifi(true)));
 }
